@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -207,7 +206,7 @@ func NewDefaultSSHExecutor(logger Logger) *DefaultSSHExecutor {
 
 func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, command string) error {
 	// Read private key
-	key, err := ioutil.ReadFile(keyPath)
+	key, err := os.ReadFile(keyPath)
 	if err != nil {
 		return fmt.Errorf("unable to read private key: %w", err)
 	}
@@ -681,8 +680,11 @@ func (p *ProxyService) forwardTCP(client, target net.Conn, targetName string) {
 	// Client -> Target
 	go func() {
 		defer wg.Done()
-		if err := p.copyData(client, target, "client->target"); err != nil && err != io.EOF {
-			p.logger.Error("Error forwarding client->target for %s: %v", targetName, err)
+		if err := p.copyData(client, target, "client->target"); err != nil {
+			// Log non-EOF errors
+			if err != io.EOF {
+				p.logger.Error("Error forwarding client->target for %s: %v", targetName, err)
+			}
 		}
 		// Close target write side to signal EOF
 		if tc, ok := target.(*net.TCPConn); ok {
@@ -693,8 +695,11 @@ func (p *ProxyService) forwardTCP(client, target net.Conn, targetName string) {
 	// Target -> Client
 	go func() {
 		defer wg.Done()
-		if err := p.copyData(target, client, "target->client"); err != nil && err != io.EOF {
-			p.logger.Error("Error forwarding target->client for %s: %v", targetName, err)
+		if err := p.copyData(target, client, "target->client"); err != nil {
+			// Log non-EOF errors
+			if err != io.EOF {
+				p.logger.Error("Error forwarding target->client for %s: %v", targetName, err)
+			}
 		}
 		// Close client write side to signal EOF
 		if cc, ok := client.(*net.TCPConn); ok {
@@ -718,8 +723,9 @@ func (p *ProxyService) copyData(dst, src net.Conn, direction string) error {
 		srcFd := int(srcFile.Fd())
 		dstFd := int(dstFile.Fd())
 		
-		// Note: Do NOT close srcFile/dstFile here as they are references to the underlying
-		// connection file descriptors. Closing them would terminate the connection.
+		// The File() method returns a duplicate file descriptor that must be closed
+		defer srcFile.Close()
+		defer dstFile.Close()
 		
 		// Use splice/sendfile on Linux for zero-copy
 		err := p.sendfileLoop(dstFd, srcFd, direction)
