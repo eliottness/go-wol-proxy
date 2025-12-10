@@ -10,7 +10,7 @@ A Wake-on-LAN proxy service written in Go that automatically wakes up servers wh
 - Monitors server health with configurable intervals via TCP connection checks
 - Caches health status to minimize latency for frequent requests
 - Packaged as a Docker container for easy deployment
-- :star: Supports graceful shutdown of servers after a period of inactivity
+- Supports graceful shutdown of servers after a period of inactivity
 
 ## How It Works
 
