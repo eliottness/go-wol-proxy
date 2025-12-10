@@ -19,8 +19,9 @@ Unlike HTTP proxies that work at the application layer, this proxy operates at t
 1. Listens on configured ports for incoming TCP or UDP connections
 2. Checks if the target server is healthy via TCP health checks
 3. If the server is down, sends Wake-on-LAN packets and waits for it to wake up
-4. Once healthy, forwards packets bidirectionally between client and target using sendfile(2) for efficient zero-copy transfer
-5. Supports both TCP (connection-oriented) and UDP (connectionless) forwarding
+4. Once healthy, forwards packets bidirectionally between client and target
+5. On Linux, uses sendfile(2) via splice syscall for efficient zero-copy transfer; automatically falls back to standard io.Copy on other platforms
+6. Supports both TCP (connection-oriented) and UDP (connectionless) forwarding
 
 ## Configuration
 

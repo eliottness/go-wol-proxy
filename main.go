@@ -537,20 +537,24 @@ func (p *ProxyService) startUDPListener(ctx context.Context, targetName string, 
 	p.logger.Info("UDP listener started for %s on %s", targetName, listenAddr)
 
 	// Read and forward UDP packets
-	buffer := make([]byte, 65535) // Max UDP packet size
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+			buffer := make([]byte, 65535) // Max UDP packet size
 			n, clientAddr, err := conn.ReadFromUDP(buffer)
 			if err != nil {
 				p.logger.Error("Failed to read UDP packet for %s: %v", targetName, err)
 				continue
 			}
 
+			// Copy the data to avoid race condition since we're passing to goroutine
+			packetData := make([]byte, n)
+			copy(packetData, buffer[:n])
+
 			// Handle packet in a goroutine
-			go p.handleUDPPacket(ctx, targetName, target, buffer[:n], clientAddr, conn)
+			go p.handleUDPPacket(ctx, targetName, target, packetData, clientAddr, conn)
 		}
 	}
 }
@@ -646,7 +650,7 @@ func (p *ProxyService) handleUDPPacket(ctx context.Context, targetName string, t
 
 	// Read response from target and send back to client
 	targetConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	response := make([]byte, 65535)
+	response := make([]byte, 65535) // Max UDP packet size
 	n, err := targetConn.Read(response)
 	if err != nil {
 		// UDP is connectionless, no response is expected in many cases
@@ -705,7 +709,7 @@ func (p *ProxyService) forwardTCP(client, target net.Conn, targetName string) {
 // copyData attempts to use sendfile(2) for zero-copy transfer when possible,
 // falls back to io.Copy if sendfile is not available
 func (p *ProxyService) copyData(dst, src net.Conn, direction string) error {
-	// Try to get file descriptors for sendfile
+	// Try to get file descriptors for sendfile on Linux
 	srcFile, srcOK := getSysConn(src)
 	dstFile, dstOK := getSysConn(dst)
 
@@ -714,12 +718,17 @@ func (p *ProxyService) copyData(dst, src net.Conn, direction string) error {
 		srcFd := int(srcFile.Fd())
 		dstFd := int(dstFile.Fd())
 		
-		// Close the file descriptors when done to prevent leaks
-		defer srcFile.Close()
-		defer dstFile.Close()
+		// Note: Do NOT close srcFile/dstFile here as they are references to the underlying
+		// connection file descriptors. Closing them would terminate the connection.
 		
 		// Use splice/sendfile on Linux for zero-copy
-		return p.sendfileLoop(dstFd, srcFd, direction)
+		err := p.sendfileLoop(dstFd, srcFd, direction)
+		if err != nil {
+			// If splice fails (e.g., on non-Linux systems), fallback to io.Copy
+			_, copyErr := io.Copy(dst, src)
+			return copyErr
+		}
+		return nil
 	}
 
 	// Fallback to regular io.Copy
@@ -737,13 +746,14 @@ func getSysConn(conn net.Conn) (*os.File, bool) {
 	return nil, false
 }
 
-// sendfileLoop uses sendfile(2) syscall for zero-copy data transfer
+// sendfileLoop uses sendfile(2) syscall for zero-copy data transfer on Linux
+// Returns an error if splice is not available or fails
 func (p *ProxyService) sendfileLoop(dst, src int, direction string) error {
 	// Create a pipe for splice operations
 	pipeR, pipeW, err := os.Pipe()
 	if err != nil {
-		// Fallback if pipe creation fails
-		return p.fallbackCopy(dst, src)
+		// Pipe creation failed, caller will fallback to io.Copy
+		return err
 	}
 	defer pipeR.Close()
 	defer pipeW.Close()
@@ -760,6 +770,7 @@ func (p *ProxyService) sendfileLoop(dst, src int, direction string) error {
 			if err == syscall.EAGAIN || err == syscall.EINTR {
 				continue
 			}
+			// Any other error (including ENOSYS on non-Linux) should trigger fallback
 			return err
 		}
 		if n == 0 {
@@ -778,35 +789,6 @@ func (p *ProxyService) sendfileLoop(dst, src int, direction string) error {
 			}
 			if w == 0 {
 				return nil
-			}
-			written += w
-		}
-	}
-}
-
-// fallbackCopy uses regular read/write when sendfile is not available
-func (p *ProxyService) fallbackCopy(dst, src int) error {
-	buf := make([]byte, 32*1024) // 32KB buffer
-	for {
-		n, err := syscall.Read(src, buf)
-		if err != nil {
-			if err == syscall.EAGAIN || err == syscall.EINTR {
-				continue
-			}
-			return err
-		}
-		if n == 0 {
-			return nil
-		}
-
-		written := 0
-		for written < n {
-			w, err := syscall.Write(dst, buf[written:n])
-			if err != nil {
-				if err == syscall.EAGAIN || err == syscall.EINTR {
-					continue
-				}
-				return err
 			}
 			written += w
 		}
