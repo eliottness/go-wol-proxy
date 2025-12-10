@@ -3,17 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
-	"net/http"
-	"net/http/httputil"
-	"net/url"
+	"net/http" // Used only for HTTP-based shutdown functionality
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -42,21 +42,21 @@ type Logger interface {
 
 // Config structs
 type Config struct {
-	Port                string   `toml:"port"`
 	Timeout             string   `toml:"timeout"`
 	PollInterval        string   `toml:"poll_interval"`
 	HealthCheckInterval string   `toml:"health_check_interval"`
 	HealthCacheDuration string   `toml:"health_cache_duration"`
-	SSLCertificate      string   `toml:"ssl_certificate"`
-	SSLCertificateKey   string   `toml:"ssl_certificate_key"`
 	Targets             []Target `toml:"targets"`
 }
 
 type Target struct {
 	Name                 string `toml:"name"`
-	Hostname             string `toml:"hostname"`
-	Destination          string `toml:"destination"`
-	HealthEndpoint       string `toml:"health_endpoint"`
+	ListenPort           int    `toml:"listen_port"`           // Port to listen on for this target
+	DestinationHost      string `toml:"destination_host"`      // Target host (IP or hostname)
+	DestinationPort      int    `toml:"destination_port"`      // Target port
+	Protocol             string `toml:"protocol"`              // "tcp" or "udp"
+	HealthCheckHost      string `toml:"health_check_host"`     // Health check host
+	HealthCheckPort      int    `toml:"health_check_port"`     // Health check port
 	MacAddress           string `toml:"mac_address"`
 	BroadcastIP          string `toml:"broadcast_ip"`
 	WolPort              int    `toml:"wol_port"`
@@ -71,16 +71,12 @@ type Target struct {
 }
 
 type ProxyConfig struct {
-	Port                 string
 	Timeout              time.Duration
 	PollInterval         time.Duration
 	HealthCheckInterval  time.Duration
 	HealthCacheDuration  time.Duration
 	Targets              map[string]*TargetState
-	HostnameMap          map[string]string        // hostname -> target name
 	InactivityThresholds map[string]time.Duration // target name -> inactivity threshold
-	SSLCertificate       string
-	SSLCertificateKey    string
 }
 
 type TargetState struct {
@@ -92,48 +88,44 @@ type TargetState struct {
 	mu           sync.RWMutex
 }
 
-// HTTP Health Checker implementation
-type HTTPHealthChecker struct {
-	client           *http.Client
+// TCP Health Checker implementation
+type TCPHealthChecker struct {
 	logger           Logger
 	initialCheckDone map[string]bool
 	initialCheckMu   sync.RWMutex
 	initialWaitGroup sync.WaitGroup
 }
 
-func NewHTTPHealthChecker(logger Logger) *HTTPHealthChecker {
-	return &HTTPHealthChecker{
-		client: &http.Client{
-			Timeout: 5 * time.Second,
-		},
+func NewTCPHealthChecker(logger Logger) *TCPHealthChecker {
+	return &TCPHealthChecker{
 		logger:           logger,
 		initialCheckDone: make(map[string]bool),
 	}
 }
 
-func (h *HTTPHealthChecker) Check(ctx context.Context, endpoint string) bool {
-	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+func (h *TCPHealthChecker) Check(ctx context.Context, endpoint string) bool {
+	// endpoint format: "host:port"
+	dialer := net.Dialer{
+		Timeout: 5 * time.Second,
+	}
+	
+	conn, err := dialer.DialContext(ctx, "tcp", endpoint)
 	if err != nil {
 		return false
 	}
-
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
+	defer conn.Close()
+	
+	return true
 }
 
-func (h *HTTPHealthChecker) StartBackgroundChecks(ctx context.Context, targets map[string]*TargetState, interval time.Duration) {
+func (h *TCPHealthChecker) StartBackgroundChecks(ctx context.Context, targets map[string]*TargetState, interval time.Duration) {
 	for name, target := range targets {
 		h.initialWaitGroup.Add(1)
 		go h.backgroundCheck(ctx, name, target, interval)
 	}
 }
 
-func (h *HTTPHealthChecker) WaitForInitialChecks(ctx context.Context) error {
+func (h *TCPHealthChecker) WaitForInitialChecks(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		h.initialWaitGroup.Wait()
@@ -148,7 +140,7 @@ func (h *HTTPHealthChecker) WaitForInitialChecks(ctx context.Context) error {
 	}
 }
 
-func (h *HTTPHealthChecker) backgroundCheck(ctx context.Context, name string, target *TargetState, interval time.Duration) {
+func (h *TCPHealthChecker) backgroundCheck(ctx context.Context, name string, target *TargetState, interval time.Duration) {
 	// Perform initial check
 	h.performCheck(name, target)
 	h.markInitialCheckDone(name)
@@ -167,11 +159,12 @@ func (h *HTTPHealthChecker) backgroundCheck(ctx context.Context, name string, ta
 	}
 }
 
-func (h *HTTPHealthChecker) performCheck(name string, target *TargetState) {
+func (h *TCPHealthChecker) performCheck(name string, target *TargetState) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	healthy := h.Check(ctx, target.Target.HealthEndpoint)
+	endpoint := net.JoinHostPort(target.Target.HealthCheckHost, strconv.Itoa(target.Target.HealthCheckPort))
+	healthy := h.Check(ctx, endpoint)
 
 	target.mu.Lock()
 	previousHealth := target.IsHealthy
@@ -184,11 +177,11 @@ func (h *HTTPHealthChecker) performCheck(name string, target *TargetState) {
 		if healthy {
 			status = "UP"
 		}
-		h.logger.Info("Health check for %s (%s): %s", name, target.Target.Hostname, status)
+		h.logger.Info("Health check for %s (%s:%d): %s", name, target.Target.HealthCheckHost, target.Target.HealthCheckPort, status)
 	}
 }
 
-func (h *HTTPHealthChecker) markInitialCheckDone(name string) {
+func (h *TCPHealthChecker) markInitialCheckDone(name string) {
 	h.initialCheckMu.Lock()
 	defer h.initialCheckMu.Unlock()
 	h.initialCheckDone[name] = true
@@ -214,7 +207,7 @@ func NewDefaultSSHExecutor(logger Logger) *DefaultSSHExecutor {
 
 func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, command string) error {
 	// Read private key
-	key, err := ioutil.ReadFile(keyPath)
+	key, err := os.ReadFile(keyPath)
 	if err != nil {
 		return fmt.Errorf("unable to read private key: %w", err)
 	}
@@ -343,7 +336,7 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
         return fmt.Errorf("target %s is missing SSH configuration or shutdown command or shutdown HTTP URL", targetName)
     }
 
-	p.logger.Info("Shutting down target %s (%s) due to inactivity", targetName, target.Hostname)
+	p.logger.Info("Shutting down target %s (%s:%d) due to inactivity", targetName, target.DestinationHost, target.DestinationPort)
 	if target.ShutdownHTTPUrl != "" {
 		// Attempt to shut down via HTTP request
 		method := target.ShutdownHTTPMethod
@@ -388,7 +381,7 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 	targetState.IsHealthy = false
 	targetState.mu.Unlock()
 
-	p.logger.Info("Target %s (%s) has been shut down", targetName, target.Hostname)
+	p.logger.Info("Target %s (%s:%d) has been shut down", targetName, target.DestinationHost, target.DestinationPort)
 	return nil
 }
 
@@ -440,10 +433,6 @@ func (p *ProxyService) checkInactiveTargets() {
 	}
 }
 
-func isSecureServer(config *ProxyConfig) bool {
-	return config.SSLCertificate != "" && config.SSLCertificateKey != ""
-}
-
 func (p *ProxyService) Start(ctx context.Context) error {
 	// Start background health checks
 	p.healthChecker.StartBackgroundChecks(
@@ -461,101 +450,359 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	// Start background inactivity monitor
 	go p.startInactivityMonitor(ctx)
 
-	p.logger.Info("Initial health checks completed, starting HTTP server")
+	p.logger.Info("Initial health checks completed, starting TCP/UDP listeners")
 
-	// Log configured targets
-	for name, target := range p.config.Targets {
-		p.logger.Info("Configured target: %s -> %s (%s)",
-			target.Target.Hostname, name, target.Target.Destination)
+	// Log configured targets and start listeners for each
+	var wg sync.WaitGroup
+	for name, targetState := range p.config.Targets {
+		target := targetState.Target
+		p.logger.Info("Configured target: %s -> %s:%d (listen on :%d, protocol: %s)",
+			name, target.DestinationHost, target.DestinationPort, target.ListenPort, target.Protocol)
+		
+		wg.Add(1)
+		go func(name string, target *Target) {
+			defer wg.Done()
+			if err := p.startListener(ctx, name, target); err != nil {
+				p.logger.Error("Failed to start listener for %s: %v", name, err)
+			}
+		}(name, target)
 	}
 
-	// Start HTTP/HTTPS server
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", p.handleRequest)
+	// Wait for all listeners to complete (which should be never in normal operation)
+	wg.Wait()
+	return nil
+}
 
-	server := &http.Server{
-		Addr:              p.config.Port,
-		Handler:           mux,
-		ReadTimeout:       10 * time.Minute,
-		WriteTimeout:      10 * time.Minute,
-		IdleTimeout:       120 * time.Second, // 2 minutes for keep-alive connections
-		ReadHeaderTimeout: 30 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+func (p *ProxyService) startListener(ctx context.Context, targetName string, target *Target) error {
+	protocol := target.Protocol
+	if protocol == "" {
+		protocol = "tcp" // default to TCP
+	}
+	
+	// Validate protocol
+	if protocol != "tcp" && protocol != "udp" {
+		return fmt.Errorf("unsupported protocol: %s (must be 'tcp' or 'udp')", protocol)
 	}
 
-	if isSecureServer(p.config) {
-		// Use HTTPS when both certificate and key are provided
-		tlsConfig := &tls.Config{
-			Certificates: make([]tls.Certificate, 1),
-		}
+	listenAddr := fmt.Sprintf(":%d", target.ListenPort)
+	
+	if protocol == "tcp" {
+		return p.startTCPListener(ctx, targetName, target, listenAddr)
+	}
+	
+	// protocol == "udp"
+	return p.startUDPListener(ctx, targetName, target, listenAddr)
+}
 
-		cert, err := tls.LoadX509KeyPair(p.config.SSLCertificate, p.config.SSLCertificateKey)
-		if err != nil {
-			return fmt.Errorf("failed to load SSL certificate: %w", err)
-		}
-		tlsConfig.Certificates[0] = cert
-		server.TLSConfig = tlsConfig
+func (p *ProxyService) startTCPListener(ctx context.Context, targetName string, target *Target, listenAddr string) error {
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", listenAddr, err)
+	}
+	defer listener.Close()
 
-		p.logger.Info("HTTPS server listening on %s with SSL certificates", p.config.Port)
-		//The files in these methods are ignored since there is already a certificate in the config.
-		return server.ListenAndServeTLS("", "")
-	} else {
-		p.logger.Info("HTTP server listening on %s", p.config.Port)
-		return server.ListenAndServe()
+	p.logger.Info("TCP listener started for %s on %s", targetName, listenAddr)
+
+	// Accept connections in a loop
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			conn, err := listener.Accept()
+			if err != nil {
+				p.logger.Error("Failed to accept connection for %s: %v", targetName, err)
+				continue
+			}
+
+			// Handle connection in a goroutine
+			go p.handleTCPConnection(ctx, targetName, target, conn)
+		}
 	}
 }
 
-func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
-	targetName := p.extractTarget(r)
-
-	if targetName == "" {
-		p.logger.Error("No target found for hostname: %s", r.Host)
-		http.Error(w, "No target configured for this hostname", http.StatusNotFound)
-		return
+func (p *ProxyService) startUDPListener(ctx context.Context, targetName string, target *Target, listenAddr string) error {
+	addr, err := net.ResolveUDPAddr("udp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to resolve UDP address %s: %w", listenAddr, err)
 	}
 
-	p.logger.Info("Incoming request for hostname: %s -> target: %s, path: %s",
-		r.Host, targetName, r.URL.Path)
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on UDP %s: %w", listenAddr, err)
+	}
+	defer conn.Close()
+
+	p.logger.Info("UDP listener started for %s on %s", targetName, listenAddr)
+
+	// Read and forward UDP packets
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			buffer := make([]byte, 65535) // Max UDP packet size
+			n, clientAddr, err := conn.ReadFromUDP(buffer)
+			if err != nil {
+				p.logger.Error("Failed to read UDP packet for %s: %v", targetName, err)
+				continue
+			}
+
+			// Copy the data to avoid race condition since we're passing to goroutine
+			packetData := make([]byte, n)
+			copy(packetData, buffer[:n])
+
+			// Handle packet in a goroutine
+			go p.handleUDPPacket(ctx, targetName, target, packetData, clientAddr, conn)
+		}
+	}
+}
+
+func (p *ProxyService) handleTCPConnection(ctx context.Context, targetName string, target *Target, clientConn net.Conn) {
+	defer clientConn.Close()
+
+	p.logger.Info("Incoming TCP connection for %s from %s", targetName, clientConn.RemoteAddr())
 
 	targetState, exists := p.config.Targets[targetName]
 	if !exists {
 		p.logger.Error("Unknown target: %s", targetName)
-		http.Error(w, "Target not found", http.StatusNotFound)
 		return
 	}
 
 	// Check if we have fresh health data
-	if p.isHealthyCached(targetState) {
-		p.logger.Info("Target %s is healthy, proxying immediately", targetName)
-		p.proxyRequest(w, r, targetState.Target)
-		return
+	if !p.isHealthyCached(targetState) {
+		// Need to wake up the server
+		p.logger.Info("Target %s appears down, attempting to wake", targetName)
+		if err := p.wakeAndWait(ctx, targetState); err != nil {
+			p.logger.Error("Failed to wake target %s: %v", targetName, err)
+			return
+		}
+		p.logger.Info("Target %s is now healthy", targetName)
 	}
 
-	// Need to wake up the server
-	p.logger.Info("Target %s appears down, attempting to wake", targetName)
-	if err := p.wakeAndWait(r.Context(), targetState); err != nil {
-		p.logger.Error("Failed to wake target %s: %v", targetName, err)
-		http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
+	// Update last activity
+	targetState.mu.Lock()
+	targetState.LastActivity = time.Now()
+	targetState.mu.Unlock()
+
+	// Connect to target
+	targetAddr := net.JoinHostPort(target.DestinationHost, strconv.Itoa(target.DestinationPort))
+	targetConn, err := net.DialTimeout("tcp", targetAddr, 30*time.Second)
+	if err != nil {
+		p.logger.Error("Failed to connect to target %s at %s: %v", targetName, targetAddr, err)
 		return
 	}
+	defer targetConn.Close()
 
-	p.logger.Info("Target %s is now healthy, proxying request", targetName)
-	p.proxyRequest(w, r, targetState.Target)
+	p.logger.Info("Connected to target %s at %s, forwarding data", targetName, targetAddr)
+
+	// Forward data bidirectionally using sendfile when possible
+	p.forwardTCP(clientConn, targetConn, targetName)
 }
 
-func (p *ProxyService) extractTarget(r *http.Request) string {
-	// Remove port from host if present
-	host := r.Host
-	if colonIndex := strings.Index(host, ":"); colonIndex != -1 {
-		host = host[:colonIndex]
+func (p *ProxyService) handleUDPPacket(ctx context.Context, targetName string, target *Target, data []byte, clientAddr *net.UDPAddr, serverConn *net.UDPConn) {
+	p.logger.Info("Incoming UDP packet for %s from %s (%d bytes)", targetName, clientAddr, len(data))
+
+	targetState, exists := p.config.Targets[targetName]
+	if !exists {
+		p.logger.Error("Unknown target: %s", targetName)
+		return
 	}
 
-	// Look up target by hostname
-	if targetName, exists := p.config.HostnameMap[host]; exists {
-		return targetName
+	// Check if we have fresh health data
+	if !p.isHealthyCached(targetState) {
+		// Need to wake up the server
+		p.logger.Info("Target %s appears down, attempting to wake", targetName)
+		if err := p.wakeAndWait(ctx, targetState); err != nil {
+			p.logger.Error("Failed to wake target %s: %v", targetName, err)
+			return
+		}
+		p.logger.Info("Target %s is now healthy", targetName)
 	}
 
-	return ""
+	// Update last activity
+	targetState.mu.Lock()
+	targetState.LastActivity = time.Now()
+	targetState.mu.Unlock()
+
+	// Forward to target
+	targetAddr := net.JoinHostPort(target.DestinationHost, strconv.Itoa(target.DestinationPort))
+	targetUDPAddr, err := net.ResolveUDPAddr("udp", targetAddr)
+	if err != nil {
+		p.logger.Error("Failed to resolve target address %s: %v", targetAddr, err)
+		return
+	}
+
+	targetConn, err := net.DialUDP("udp", nil, targetUDPAddr)
+	if err != nil {
+		p.logger.Error("Failed to dial target %s: %v", targetAddr, err)
+		return
+	}
+	defer targetConn.Close()
+
+	// Send packet to target
+	_, err = targetConn.Write(data)
+	if err != nil {
+		p.logger.Error("Failed to forward UDP packet to target %s: %v", targetName, err)
+		return
+	}
+
+	// Read response from target and send back to client
+	targetConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	response := make([]byte, 65535) // Max UDP packet size
+	n, err := targetConn.Read(response)
+	if err != nil {
+		// UDP is connectionless, no response is expected in many cases
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			p.logger.Info("No response from target %s (timeout)", targetName)
+			return
+		}
+		p.logger.Error("Failed to read response from target %s: %v", targetName, err)
+		return
+	}
+
+	// Send response back to client
+	_, err = serverConn.WriteToUDP(response[:n], clientAddr)
+	if err != nil {
+		p.logger.Error("Failed to send response to client: %v", err)
+		return
+	}
+
+	p.logger.Info("Forwarded UDP response to client (%d bytes)", n)
+}
+
+// forwardTCP copies data bidirectionally between client and target connections
+// Uses sendfile(2) when possible for zero-copy transfer
+func (p *ProxyService) forwardTCP(client, target net.Conn, targetName string) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Client -> Target
+	go func() {
+		defer wg.Done()
+		if err := p.copyData(client, target, "client->target"); err != nil {
+			// Log non-EOF errors
+			if err != io.EOF {
+				p.logger.Error("Error forwarding client->target for %s: %v", targetName, err)
+			}
+		}
+		// Close target write side to signal EOF
+		if tc, ok := target.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+	}()
+
+	// Target -> Client
+	go func() {
+		defer wg.Done()
+		if err := p.copyData(target, client, "target->client"); err != nil {
+			// Log non-EOF errors
+			if err != io.EOF {
+				p.logger.Error("Error forwarding target->client for %s: %v", targetName, err)
+			}
+		}
+		// Close client write side to signal EOF
+		if cc, ok := client.(*net.TCPConn); ok {
+			cc.CloseWrite()
+		}
+	}()
+
+	wg.Wait()
+	p.logger.Info("Connection closed for %s", targetName)
+}
+
+// copyData copies data between connections, using sendfile(2) on Linux when available
+func (p *ProxyService) copyData(dst, src net.Conn, direction string) error {
+	// On Linux, try to use splice for zero-copy transfer
+	if p.trySendfile(dst, src) {
+		return nil
+	}
+	
+	// Fallback to regular io.Copy
+	_, err := io.Copy(dst, src)
+	return err
+}
+
+// trySendfile attempts to use sendfile(2) for zero-copy transfer
+// Returns true if successful, false if not available (non-Linux or error)
+func (p *ProxyService) trySendfile(dst, src net.Conn) bool {
+	// Try to get file descriptors for sendfile
+	srcFile, srcOK := getSysConn(src)
+	dstFile, dstOK := getSysConn(dst)
+
+	if !srcOK || !dstOK {
+		return false
+	}
+
+	srcFd := int(srcFile.Fd())
+	dstFd := int(dstFile.Fd())
+	
+	// The File() method returns a duplicate file descriptor that must be closed
+	defer srcFile.Close()
+	defer dstFile.Close()
+	
+	// Try splice - if it fails (e.g., ENOSYS on non-Linux), caller will use io.Copy
+	err := p.sendfileLoop(dstFd, srcFd)
+	return err == nil
+}
+
+// getSysConn extracts the underlying file from a net.Conn
+func getSysConn(conn net.Conn) (*os.File, bool) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		if f, err := tc.File(); err == nil {
+			return f, true
+		}
+	}
+	return nil, false
+}
+
+// sendfileLoop uses sendfile(2) syscall for zero-copy data transfer on Linux
+// Returns an error if splice is not available or fails
+func (p *ProxyService) sendfileLoop(dst, src int) error {
+	// Create a pipe for splice operations
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		// Pipe creation failed, caller will fallback to io.Copy
+		return err
+	}
+	defer pipeR.Close()
+	defer pipeW.Close()
+
+	pipeRFd := int(pipeR.Fd())
+	pipeWFd := int(pipeW.Fd())
+
+	// Use splice to move data: src -> pipe -> dst
+	// This is zero-copy on Linux
+	for {
+		// Splice from source to pipe
+		n, err := syscall.Splice(src, nil, pipeWFd, nil, 65536, 0)
+		if err != nil {
+			if err == syscall.EAGAIN || err == syscall.EINTR {
+				continue
+			}
+			// Any other error (including ENOSYS on non-Linux) should trigger fallback
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+
+		// Splice from pipe to destination
+		written := int64(0)
+		for written < n {
+			w, err := syscall.Splice(pipeRFd, nil, dst, nil, int(n-written), 0)
+			if err != nil {
+				if err == syscall.EAGAIN || err == syscall.EINTR {
+					continue
+				}
+				return err
+			}
+			if w == 0 {
+				return nil
+			}
+			written += w
+		}
+	}
 }
 
 func (p *ProxyService) isHealthyCached(target *TargetState) bool {
@@ -594,8 +841,8 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) err
 		return fmt.Errorf("failed to send WOL: %w", err)
 	}
 
-	p.logger.Info("WOL packet sent to %s (%s), waiting for server to wake",
-		target.Target.Name, target.Target.Hostname)
+	p.logger.Info("WOL packet sent to %s (%s:%d), waiting for server to wake",
+		target.Target.Name, target.Target.DestinationHost, target.Target.DestinationPort)
 
 	return p.waitForWake(ctx, target)
 }
@@ -611,6 +858,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 	defer wolTicker.Stop()
 
 	wakeStartTime := time.Now()
+	healthEndpoint := net.JoinHostPort(target.Target.HealthCheckHost, strconv.Itoa(target.Target.HealthCheckPort))
 
 	for {
 		select {
@@ -633,11 +881,11 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 				p.logger.Error("Failed to send additional WOL packet: %v", err)
 				// Continue waiting even if a packet fails to send
 			} else {
-				p.logger.Info("Sent additional WOL packet to %s (%s)",
-					target.Target.Name, target.Target.Hostname)
+				p.logger.Info("Sent additional WOL packet to %s (%s:%d)",
+					target.Target.Name, target.Target.DestinationHost, target.Target.DestinationPort)
 			}
 		case <-healthCheckTicker.C:
-			if p.healthChecker.Check(ctx, target.Target.HealthEndpoint) {
+			if p.healthChecker.Check(ctx, healthEndpoint) {
 				target.mu.Lock()
 				target.IsHealthy = true
 				target.LastCheck = time.Now()
@@ -645,8 +893,8 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 				target.mu.Unlock()
 
 				wakeDuration := time.Since(wakeStartTime)
-				p.logger.Info("Target %s (%s) woke up after %v",
-					target.Target.Name, target.Target.Hostname, wakeDuration)
+				p.logger.Info("Target %s (%s:%d) woke up after %v",
+					target.Target.Name, target.Target.DestinationHost, target.Target.DestinationPort, wakeDuration)
 				return nil
 			}
 		}
@@ -657,80 +905,6 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 	}
 }
 
-func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, target *Target) {
-	if targetState, exists := p.config.Targets[target.Name]; exists {
-		targetState.mu.Lock()
-		targetState.LastActivity = time.Now()
-		targetState.mu.Unlock()
-	}
-
-	targetURL, err := url.Parse(target.Destination)
-	if err != nil {
-		p.logger.Error("Invalid target URL %s: %v", target.Destination, err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-
-	// Create a custom transport with optimized settings for large uploads
-	proxy.Transport = &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   60 * time.Second, // Increased timeout for slow connections
-			KeepAlive: 60 * time.Second, // Increased keep-alive
-			DualStack: true,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       120 * time.Second, // Increased idle timeout
-		TLSHandshakeTimeout:   20 * time.Second,  // Increased TLS handshake timeout
-		ExpectContinueTimeout: 5 * time.Second,   // Increased expect-continue timeout
-		MaxIdleConnsPerHost:   10,
-		// Disable compression to avoid issues with already compressed data
-		DisableCompression: true,
-		// Increase response header timeout
-		ResponseHeaderTimeout: 60 * time.Second, // Increased response header timeout
-		// No timeout for reading the entire response
-		ReadBufferSize:  1024 * 1024, // 1MB buffer for reading
-		WriteBufferSize: 1024 * 1024, // 1MB buffer for writing
-	}
-
-	// Customize the proxy to handle errors and logging
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		// Set the Host header to the target's hostname from the URL
-		req.Host = targetURL.Host
-
-		// Log request details including content length for debugging
-		contentLength := req.ContentLength
-		contentType := req.Header.Get("Content-Type")
-		p.logger.Info("Proxying %s %s to %s (Host: %s, Content-Length: %d, Content-Type: %s)",
-			req.Method, req.URL.Path, targetURL, req.Host, contentLength, contentType)
-
-		// For large uploads, add special handling
-		if contentLength > 1024*1024 { // If larger than 1MB
-			p.logger.Info("Large upload detected (%d bytes) for %s %s",
-				contentLength, req.Method, req.URL.Path)
-		}
-	}
-
-	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		p.logger.Error("Proxy error for %s (%s): %v", target.Name, target.Hostname, err)
-		http.Error(rw, "Bad Gateway", http.StatusBadGateway)
-	}
-
-	// Disable buffering of response body for streaming uploads/downloads
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		p.logger.Info("Response from %s: status=%d, content-length=%d",
-			target.Name, resp.StatusCode, resp.ContentLength)
-		return nil
-	}
-
-	proxy.ServeHTTP(w, r)
-}
-
 // Config loader
 func LoadConfig(filename string) (*ProxyConfig, error) {
 	var config Config
@@ -739,18 +913,7 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		return nil, err
 	}
 
-	// Trim whitespace and handle optional SSL certificate fields
-	config.SSLCertificate = strings.TrimSpace(config.SSLCertificate)
-	config.SSLCertificateKey = strings.TrimSpace(config.SSLCertificateKey)
-
 	// Set defaults
-	if config.Port == "" {
-		config.Port = ":8080"
-	}
-	if !strings.HasPrefix(config.Port, ":") {
-		config.Port = ":" + config.Port
-	}
-
 	timeout, err := time.ParseDuration(config.Timeout)
 	if err != nil {
 		return nil, fmt.Errorf("invalid timeout: %w", err)
@@ -772,19 +935,38 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 	}
 
 	targets := make(map[string]*TargetState)
-	hostnameMap := make(map[string]string)
 	inactivityThresholds := make(map[string]time.Duration)
+	listenPorts := make(map[int]string) // port -> target name for duplicate check
 
     for _, target := range config.Targets {
-        if target.Hostname == "" {
-            return nil, fmt.Errorf("target %s is missing hostname", target.Name)
+        // Validate required fields
+        if target.ListenPort <= 0 || target.ListenPort > 65535 {
+            return nil, fmt.Errorf("target %s has invalid listen_port %d (must be 1-65535)", target.Name, target.ListenPort)
         }
-
-		// Check for duplicate hostnames
-		if existingTarget, exists := hostnameMap[target.Hostname]; exists {
-			return nil, fmt.Errorf("duplicate hostname %s for targets %s and %s",
-				target.Hostname, existingTarget, target.Name)
-		}
+        
+        // Check for duplicate listen ports
+        if existingTarget, exists := listenPorts[target.ListenPort]; exists {
+            return nil, fmt.Errorf("duplicate listen_port %d for targets %s and %s", target.ListenPort, existingTarget, target.Name)
+        }
+        listenPorts[target.ListenPort] = target.Name
+        
+        if target.DestinationHost == "" {
+            return nil, fmt.Errorf("target %s is missing destination_host", target.Name)
+        }
+        if target.DestinationPort <= 0 || target.DestinationPort > 65535 {
+            return nil, fmt.Errorf("target %s has invalid destination_port %d (must be 1-65535)", target.Name, target.DestinationPort)
+        }
+        if target.HealthCheckHost == "" {
+            return nil, fmt.Errorf("target %s is missing health_check_host", target.Name)
+        }
+        if target.HealthCheckPort <= 0 || target.HealthCheckPort > 65535 {
+            return nil, fmt.Errorf("target %s has invalid health_check_port %d (must be 1-65535)", target.Name, target.HealthCheckPort)
+        }
+        
+        // Validate protocol if specified
+        if target.Protocol != "" && target.Protocol != "tcp" && target.Protocol != "udp" {
+            return nil, fmt.Errorf("target %s has invalid protocol %s (must be 'tcp' or 'udp')", target.Name, target.Protocol)
+        }
 
         // Validate shutdown configuration
         // Disallow using both SSH shutdown command and HTTP shutdown URL
@@ -811,19 +993,14 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 			Target:       &targetCopy,
 			LastActivity: time.Now(), // Initialize with current time
 		}
-		hostnameMap[target.Hostname] = target.Name
 	}
 
 	return &ProxyConfig{
-		Port:                 config.Port,
-		SSLCertificate:       config.SSLCertificate,
-		SSLCertificateKey:    config.SSLCertificateKey,
 		Timeout:              timeout,
 		PollInterval:         pollInterval,
 		HealthCheckInterval:  healthCheckInterval,
 		HealthCacheDuration:  healthCacheDuration,
 		Targets:              targets,
-		HostnameMap:          hostnameMap,
 		InactivityThresholds: inactivityThresholds,
 	}, nil
 }
@@ -855,16 +1032,34 @@ func main() {
 
 	// Initialize dependencies
 	logger := &StdLogger{}
-	healthChecker := NewHTTPHealthChecker(logger)
+	healthChecker := NewTCPHealthChecker(logger)
 	wolSender := NewUDPWOLSender(logger)
 	sshExecutor := NewDefaultSSHExecutor(logger)
 
 	// Create proxy service
 	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger)
 
+	// Set up context with signal cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle SIGTERM and SIGINT for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+	
+	go func() {
+		sig := <-sigChan
+		logger.Info("Received signal %v, shutting down gracefully...", sig)
+		cancel()
+	}()
+
 	// Start the service
-	ctx := context.Background()
+	logger.Info("Starting go-wol-proxy...")
 	if err := proxy.Start(ctx); err != nil {
-		log.Fatalf("Failed to start proxy: %v", err)
+		if err == context.Canceled {
+			logger.Info("Service stopped")
+		} else {
+			log.Fatalf("Failed to start proxy: %v", err)
+		}
 	}
 }
