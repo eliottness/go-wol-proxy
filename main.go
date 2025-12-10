@@ -7,7 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
+	"net/http" // Used only for HTTP-based shutdown functionality
 	"os"
 	"strconv"
 	"strings"
@@ -487,11 +487,10 @@ func (p *ProxyService) startListener(ctx context.Context, targetName string, tar
 	
 	if protocol == "tcp" {
 		return p.startTCPListener(ctx, targetName, target, listenAddr)
-	} else if protocol == "udp" {
-		return p.startUDPListener(ctx, targetName, target, listenAddr)
 	}
 	
-	return fmt.Errorf("unsupported protocol: %s", protocol)
+	// protocol == "udp"
+	return p.startUDPListener(ctx, targetName, target, listenAddr)
 }
 
 func (p *ProxyService) startTCPListener(ctx context.Context, targetName string, target *Target, listenAddr string) error {
@@ -711,35 +710,39 @@ func (p *ProxyService) forwardTCP(client, target net.Conn, targetName string) {
 	p.logger.Info("Connection closed for %s", targetName)
 }
 
-// copyData attempts to use sendfile(2) for zero-copy transfer when possible,
-// falls back to io.Copy if sendfile is not available
+// copyData copies data between connections, using sendfile(2) on Linux when available
 func (p *ProxyService) copyData(dst, src net.Conn, direction string) error {
-	// Try to get file descriptors for sendfile on Linux
-	srcFile, srcOK := getSysConn(src)
-	dstFile, dstOK := getSysConn(dst)
-
-	if srcOK && dstOK {
-		// Both are file descriptors, try sendfile
-		srcFd := int(srcFile.Fd())
-		dstFd := int(dstFile.Fd())
-		
-		// The File() method returns a duplicate file descriptor that must be closed
-		defer srcFile.Close()
-		defer dstFile.Close()
-		
-		// Use splice/sendfile on Linux for zero-copy
-		err := p.sendfileLoop(dstFd, srcFd, direction)
-		if err != nil {
-			// If splice fails (e.g., on non-Linux systems), fallback to io.Copy
-			_, copyErr := io.Copy(dst, src)
-			return copyErr
-		}
+	// On Linux, try to use splice for zero-copy transfer
+	if p.trySendfile(dst, src) {
 		return nil
 	}
-
+	
 	// Fallback to regular io.Copy
 	_, err := io.Copy(dst, src)
 	return err
+}
+
+// trySendfile attempts to use sendfile(2) for zero-copy transfer
+// Returns true if successful, false if not available (non-Linux or error)
+func (p *ProxyService) trySendfile(dst, src net.Conn) bool {
+	// Try to get file descriptors for sendfile
+	srcFile, srcOK := getSysConn(src)
+	dstFile, dstOK := getSysConn(dst)
+
+	if !srcOK || !dstOK {
+		return false
+	}
+
+	srcFd := int(srcFile.Fd())
+	dstFd := int(dstFile.Fd())
+	
+	// The File() method returns a duplicate file descriptor that must be closed
+	defer srcFile.Close()
+	defer dstFile.Close()
+	
+	// Try splice - if it fails (e.g., ENOSYS on non-Linux), caller will use io.Copy
+	err := p.sendfileLoop(dstFd, srcFd)
+	return err == nil
 }
 
 // getSysConn extracts the underlying file from a net.Conn
@@ -754,7 +757,7 @@ func getSysConn(conn net.Conn) (*os.File, bool) {
 
 // sendfileLoop uses sendfile(2) syscall for zero-copy data transfer on Linux
 // Returns an error if splice is not available or fails
-func (p *ProxyService) sendfileLoop(dst, src int, direction string) error {
+func (p *ProxyService) sendfileLoop(dst, src int) error {
 	// Create a pipe for splice operations
 	pipeR, pipeW, err := os.Pipe()
 	if err != nil {
