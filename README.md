@@ -4,7 +4,7 @@ A Wake-on-LAN proxy service written in Go that automatically wakes up servers wh
 
 ## Features
 
-- Forwards TCP and UDP packets to configured target servers at the network level
+- Forwards both TCP and UDP packets simultaneously on the same port to configured target servers
 - Uses sendfile(2) syscall for zero-copy data transfer (Linux)
 - Automatically sends Wake-on-LAN packets to wake up offline servers
 - Monitors server health with configurable intervals via TCP connection checks
@@ -14,14 +14,14 @@ A Wake-on-LAN proxy service written in Go that automatically wakes up servers wh
 
 ## How It Works
 
-Unlike HTTP proxies that work at the application layer, this proxy operates at the TCP/UDP level:
+This proxy operates at the network level and listens on both TCP and UDP simultaneously:
 
-1. Listens on configured ports for incoming TCP or UDP connections
+1. Listens on configured ports for incoming TCP and UDP connections
 2. Checks if the target server is healthy via TCP health checks
 3. If the server is down, sends Wake-on-LAN packets and waits for it to wake up
 4. Once healthy, forwards packets bidirectionally between client and target
 5. On Linux, uses sendfile(2) via splice syscall for efficient zero-copy transfer; automatically falls back to standard io.Copy on other platforms
-6. Supports both TCP (connection-oriented) and UDP (connectionless) forwarding
+6. Supports both TCP (connection-oriented) and UDP (connectionless) forwarding on the same port
 
 ## Configuration
 
@@ -35,10 +35,9 @@ health_cache_duration = "10s"  # How long to trust cached health status
 
 [[targets]]
 name = "service"
-listen_port = 8080                           # Port to listen on for this target
+listen_port = 8080                           # Port to listen on for this target (both TCP and UDP)
 destination_host = "service.local"            # Target host (IP or hostname)
 destination_port = 80                         # Target port
-protocol = "tcp"                              # Protocol: "tcp" or "udp"
 health_check_host = "service.local"           # Health check host
 health_check_port = 80                        # Health check port (TCP connection check)
 mac_address = "7c:8b:ad:da:be:51"             # MAC address for WOL
@@ -63,10 +62,9 @@ shutdown_command = "sudo systemctl suspend"   # Command to execute for shutdown
 
 [[targets]]
 name = "service2"
-listen_port = 8081                            # Different port for second target
+listen_port = 8081                            # Different port for second target (both TCP and UDP)
 destination_host = "service2.local"
 destination_port = 80
-protocol = "tcp"
 health_check_host = "service2.local"
 health_check_port = 80
 mac_address = "c9:69:45:d2:1e:12"

@@ -51,10 +51,9 @@ type Config struct {
 
 type Target struct {
 	Name                 string `toml:"name"`
-	ListenPort           int    `toml:"listen_port"`           // Port to listen on for this target
+	ListenPort           int    `toml:"listen_port"`           // Port to listen on for this target (both TCP and UDP)
 	DestinationHost      string `toml:"destination_host"`      // Target host (IP or hostname)
 	DestinationPort      int    `toml:"destination_port"`      // Target port
-	Protocol             string `toml:"protocol"`              // "tcp" or "udp"
 	HealthCheckHost      string `toml:"health_check_host"`     // Health check host
 	HealthCheckPort      int    `toml:"health_check_port"`     // Health check port
 	MacAddress           string `toml:"mac_address"`
@@ -456,8 +455,8 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for name, targetState := range p.config.Targets {
 		target := targetState.Target
-		p.logger.Info("Configured target: %s -> %s:%d (listen on :%d, protocol: %s)",
-			name, target.DestinationHost, target.DestinationPort, target.ListenPort, target.Protocol)
+		p.logger.Info("Configured target: %s -> %s:%d (listen on :%d, protocols: TCP and UDP)",
+			name, target.DestinationHost, target.DestinationPort, target.ListenPort)
 		
 		wg.Add(1)
 		go func(name string, target *Target) {
@@ -474,24 +473,47 @@ func (p *ProxyService) Start(ctx context.Context) error {
 }
 
 func (p *ProxyService) startListener(ctx context.Context, targetName string, target *Target) error {
-	protocol := target.Protocol
-	if protocol == "" {
-		protocol = "tcp" // default to TCP
-	}
-	
-	// Validate protocol
-	if protocol != "tcp" && protocol != "udp" {
-		return fmt.Errorf("unsupported protocol: %s (must be 'tcp' or 'udp')", protocol)
-	}
-
 	listenAddr := fmt.Sprintf(":%d", target.ListenPort)
 	
-	if protocol == "tcp" {
-		return p.startTCPListener(ctx, targetName, target, listenAddr)
+	// Always start both TCP and UDP listeners on the same port
+	var wg sync.WaitGroup
+	errChan := make(chan error, 2)
+	
+	wg.Add(2)
+	
+	// Start TCP listener
+	go func() {
+		defer wg.Done()
+		if err := p.startTCPListener(ctx, targetName, target, listenAddr); err != nil {
+			errChan <- fmt.Errorf("TCP listener error: %w", err)
+		}
+	}()
+	
+	// Start UDP listener
+	go func() {
+		defer wg.Done()
+		if err := p.startUDPListener(ctx, targetName, target, listenAddr); err != nil {
+			errChan <- fmt.Errorf("UDP listener error: %w", err)
+		}
+	}()
+	
+	// Wait for either an error or context cancellation
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
+	
+	// Return the first error if any
+	select {
+	case err := <-errChan:
+		if err != nil {
+			return err
+		}
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	
-	// protocol == "udp"
-	return p.startUDPListener(ctx, targetName, target, listenAddr)
+	return nil
 }
 
 func (p *ProxyService) startTCPListener(ctx context.Context, targetName string, target *Target, listenAddr string) error {
@@ -963,11 +985,6 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
             return nil, fmt.Errorf("target %s has invalid health_check_port %d (must be 1-65535)", target.Name, target.HealthCheckPort)
         }
         
-        // Validate protocol if specified
-        if target.Protocol != "" && target.Protocol != "tcp" && target.Protocol != "udp" {
-            return nil, fmt.Errorf("target %s has invalid protocol %s (must be 'tcp' or 'udp')", target.Name, target.Protocol)
-        }
-
         // Validate shutdown configuration
         // Disallow using both SSH shutdown command and HTTP shutdown URL
         if strings.TrimSpace(target.ShutdownHTTPUrl) != "" && strings.TrimSpace(target.ShutdownCommand) != "" {
