@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http" // Used only for HTTP-based shutdown functionality
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
@@ -1038,9 +1039,27 @@ func main() {
 	// Create proxy service
 	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger)
 
+	// Set up context with signal cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle SIGTERM and SIGINT for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+	
+	go func() {
+		sig := <-sigChan
+		logger.Info("Received signal %v, shutting down gracefully...", sig)
+		cancel()
+	}()
+
 	// Start the service
-	ctx := context.Background()
+	logger.Info("Starting go-wol-proxy...")
 	if err := proxy.Start(ctx); err != nil {
-		log.Fatalf("Failed to start proxy: %v", err)
+		if err == context.Canceled {
+			logger.Info("Service stopped")
+		} else {
+			log.Fatalf("Failed to start proxy: %v", err)
+		}
 	}
 }
