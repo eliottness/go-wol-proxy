@@ -478,6 +478,11 @@ func (p *ProxyService) startListener(ctx context.Context, targetName string, tar
 	if protocol == "" {
 		protocol = "tcp" // default to TCP
 	}
+	
+	// Validate protocol
+	if protocol != "tcp" && protocol != "udp" {
+		return fmt.Errorf("unsupported protocol: %s (must be 'tcp' or 'udp')", protocol)
+	}
 
 	listenAddr := fmt.Sprintf(":%d", target.ListenPort)
 	
@@ -709,6 +714,10 @@ func (p *ProxyService) copyData(dst, src net.Conn, direction string) error {
 		srcFd := int(srcFile.Fd())
 		dstFd := int(dstFile.Fd())
 		
+		// Close the file descriptors when done to prevent leaks
+		defer srcFile.Close()
+		defer dstFile.Close()
+		
 		// Use splice/sendfile on Linux for zero-copy
 		return p.sendfileLoop(dstFd, srcFd, direction)
 	}
@@ -719,7 +728,7 @@ func (p *ProxyService) copyData(dst, src net.Conn, direction string) error {
 }
 
 // getSysConn extracts the underlying file from a net.Conn
-func getSysConn(conn net.Conn) (interface{ Fd() uintptr }, bool) {
+func getSysConn(conn net.Conn) (*os.File, bool) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		if f, err := tc.File(); err == nil {
 			return f, true
@@ -751,9 +760,6 @@ func (p *ProxyService) sendfileLoop(dst, src int, direction string) error {
 			if err == syscall.EAGAIN || err == syscall.EINTR {
 				continue
 			}
-			if err == io.EOF || n == 0 {
-				return nil
-			}
 			return err
 		}
 		if n == 0 {
@@ -771,7 +777,7 @@ func (p *ProxyService) sendfileLoop(dst, src int, direction string) error {
 				return err
 			}
 			if w == 0 {
-				return io.EOF
+				return nil
 			}
 			written += w
 		}
@@ -786,9 +792,6 @@ func (p *ProxyService) fallbackCopy(dst, src int) error {
 		if err != nil {
 			if err == syscall.EAGAIN || err == syscall.EINTR {
 				continue
-			}
-			if err == io.EOF || n == 0 {
-				return nil
 			}
 			return err
 		}
@@ -941,23 +944,36 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 
 	targets := make(map[string]*TargetState)
 	inactivityThresholds := make(map[string]time.Duration)
+	listenPorts := make(map[int]string) // port -> target name for duplicate check
 
     for _, target := range config.Targets {
         // Validate required fields
-        if target.ListenPort == 0 {
-            return nil, fmt.Errorf("target %s is missing listen_port", target.Name)
+        if target.ListenPort <= 0 || target.ListenPort > 65535 {
+            return nil, fmt.Errorf("target %s has invalid listen_port %d (must be 1-65535)", target.Name, target.ListenPort)
         }
+        
+        // Check for duplicate listen ports
+        if existingTarget, exists := listenPorts[target.ListenPort]; exists {
+            return nil, fmt.Errorf("duplicate listen_port %d for targets %s and %s", target.ListenPort, existingTarget, target.Name)
+        }
+        listenPorts[target.ListenPort] = target.Name
+        
         if target.DestinationHost == "" {
             return nil, fmt.Errorf("target %s is missing destination_host", target.Name)
         }
-        if target.DestinationPort == 0 {
-            return nil, fmt.Errorf("target %s is missing destination_port", target.Name)
+        if target.DestinationPort <= 0 || target.DestinationPort > 65535 {
+            return nil, fmt.Errorf("target %s has invalid destination_port %d (must be 1-65535)", target.Name, target.DestinationPort)
         }
         if target.HealthCheckHost == "" {
             return nil, fmt.Errorf("target %s is missing health_check_host", target.Name)
         }
-        if target.HealthCheckPort == 0 {
-            return nil, fmt.Errorf("target %s is missing health_check_port", target.Name)
+        if target.HealthCheckPort <= 0 || target.HealthCheckPort > 65535 {
+            return nil, fmt.Errorf("target %s has invalid health_check_port %d (must be 1-65535)", target.Name, target.HealthCheckPort)
+        }
+        
+        // Validate protocol if specified
+        if target.Protocol != "" && target.Protocol != "tcp" && target.Protocol != "udp" {
+            return nil, fmt.Errorf("target %s has invalid protocol %s (must be 'tcp' or 'udp')", target.Name, target.Protocol)
         }
 
         // Validate shutdown configuration
