@@ -511,10 +511,8 @@ func (p *ProxyService) startListener(ctx context.Context, targetName string, tar
 				// Channel closed, both listeners exited normally
 				return nil
 			}
-			if err != nil {
-				// One listener had an error
-				return err
-			}
+			// One listener had an error during startup
+			return err
 		case <-ctx.Done():
 			// Context cancelled, wait for both listeners to clean up
 			wg.Wait()
