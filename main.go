@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -484,7 +485,7 @@ func (p *ProxyService) startListener(ctx context.Context, targetName string, tar
 	// Start TCP listener
 	go func() {
 		defer wg.Done()
-		if err := p.startTCPListener(ctx, targetName, target, listenAddr); err != nil && err != context.Canceled {
+		if err := p.startTCPListener(ctx, targetName, target, listenAddr); err != nil && !errors.Is(err, context.Canceled) {
 			errChan <- fmt.Errorf("TCP listener error: %w", err)
 		}
 	}()
@@ -492,7 +493,7 @@ func (p *ProxyService) startListener(ctx context.Context, targetName string, tar
 	// Start UDP listener
 	go func() {
 		defer wg.Done()
-		if err := p.startUDPListener(ctx, targetName, target, listenAddr); err != nil && err != context.Canceled {
+		if err := p.startUDPListener(ctx, targetName, target, listenAddr); err != nil && !errors.Is(err, context.Canceled) {
 			errChan <- fmt.Errorf("UDP listener error: %w", err)
 		}
 	}()
@@ -504,20 +505,19 @@ func (p *ProxyService) startListener(ctx context.Context, targetName string, tar
 	}()
 	
 	// Return the first error if any, or wait for context cancellation
-	for {
-		select {
-		case err, ok := <-errChan:
-			if !ok {
-				// Channel closed, both listeners exited normally
-				return nil
-			}
-			// One listener had an error during startup
-			return err
-		case <-ctx.Done():
-			// Context cancelled, wait for both listeners to clean up
-			wg.Wait()
-			return ctx.Err()
+	select {
+	case err, ok := <-errChan:
+		if !ok {
+			// Channel closed, both listeners exited normally
+			return nil
 		}
+		// One listener had an error during startup - wait for cleanup
+		wg.Wait()
+		return err
+	case <-ctx.Done():
+		// Context cancelled, wait for both listeners to clean up
+		wg.Wait()
+		return ctx.Err()
 	}
 }
 
