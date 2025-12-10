@@ -1,40 +1,49 @@
 # Go WOL Proxy
 
-A Wake-on-LAN proxy service written in Go that automatically wakes up servers when requests are made to them.
+A Wake-on-LAN proxy service written in Go that automatically wakes up servers when TCP/UDP connections are made to them. Uses sendfile(2) for efficient zero-copy packet forwarding.
 
 ## Features
 
-- Proxies HTTP requests to configured target servers
+- Forwards TCP and UDP packets to configured target servers at the network level
+- Uses sendfile(2) syscall for zero-copy data transfer (Linux)
 - Automatically sends Wake-on-LAN packets to wake up offline servers
-- Monitors server health with configurable intervals
+- Monitors server health with configurable intervals via TCP connection checks
 - Caches health status to minimize latency for frequent requests
 - Packaged as a Docker container for easy deployment
-- :star: new :star: Supports graceful shutdown of servers after a period of inactivity
+- :star: Supports graceful shutdown of servers after a period of inactivity
+
+## How It Works
+
+Unlike HTTP proxies that work at the application layer, this proxy operates at the TCP/UDP level:
+
+1. Listens on configured ports for incoming TCP or UDP connections
+2. Checks if the target server is healthy via TCP health checks
+3. If the server is down, sends Wake-on-LAN packets and waits for it to wake up
+4. Once healthy, forwards packets bidirectionally between client and target using sendfile(2) for efficient zero-copy transfer
+5. Supports both TCP (connection-oriented) and UDP (connectionless) forwarding
 
 ## Configuration
 
 The service is configured using a TOML file. Here's an example configuration:
 
 ```toml
-port = ":8080"                 # Port to listen on
 timeout = "1m"                 # How long to wait for server to wake up
 poll_interval = "5s"           # How often to check health during wake-up
 health_check_interval = "30s"  # Background health check frequency
 health_cache_duration = "10s"  # How long to trust cached health status
 
-# Optional SSL configuration Do not add these values unless you plan to use TLS/HTTPS
-ssl_certificate = "/path/to/cert.pem"   # Path to your SSL certificate
-ssl_certificate_key = "/path/to/key.pem" # Path to your SSL private key
-
-
 [[targets]]
 name = "service"
-hostname = "service.host.com"                 # The "external" hostname - what this server receives as a Host header
-destination = "http://service.local"          # The actual url to the server
-health_endpoint = "http://service.local/ping" # url to check health
+listen_port = 8080                           # Port to listen on for this target
+destination_host = "service.local"            # Target host (IP or hostname)
+destination_port = 80                         # Target port
+protocol = "tcp"                              # Protocol: "tcp" or "udp"
+health_check_host = "service.local"           # Health check host
+health_check_port = 80                        # Health check port (TCP connection check)
 mac_address = "7c:8b:ad:da:be:51"             # MAC address for WOL
 broadcast_ip = "10.0.0.255"                   # Broadcast IP for WOL
 wol_port = 9                                  # Port for WOL packets
+
 # Optional: Graceful shutdown configuration (SSH or HTTP)
 inactivity_threshold = "1h"                   # Shut down after 1 hour of inactivity
 
@@ -53,9 +62,12 @@ shutdown_command = "sudo systemctl suspend"   # Command to execute for shutdown
 
 [[targets]]
 name = "service2"
-hostname = "service2.host.com"
-destination = "http://service2.local"
-health_endpoint = "http://service2.local/ping"
+listen_port = 8081                            # Different port for second target
+destination_host = "service2.local"
+destination_port = 80
+protocol = "tcp"
+health_check_host = "service2.local"
+health_check_port = 80
 mac_address = "c9:69:45:d2:1e:12"
 broadcast_ip = "10.0.0.255"
 wol_port = 9
