@@ -498,27 +498,22 @@ func (p *ProxyService) startListener(ctx context.Context, targetName string, tar
 		}
 	}()
 	
-	// Wait for both listeners to complete or return first error
+	// Wait for both listeners to complete
 	go func() {
 		wg.Wait()
 		close(errChan)
 	}()
 	
-	// Return the first error if any, or wait for context cancellation
-	select {
-	case err, ok := <-errChan:
-		if !ok {
-			// Channel closed, both listeners exited normally
-			return nil
-		}
-		// One listener had an error during startup - wait for cleanup
+	// Return the first error if any, or wait for both to complete
+	for err := range errChan {
+		// Got an error from one of the listeners
+		// Wait for both to finish before returning
 		wg.Wait()
 		return err
-	case <-ctx.Done():
-		// Context cancelled, wait for both listeners to clean up
-		wg.Wait()
-		return ctx.Err()
 	}
+	
+	// Both listeners completed successfully (context was cancelled)
+	return ctx.Err()
 }
 
 func (p *ProxyService) startTCPListener(ctx context.Context, targetName string, target *Target, listenAddr string) error {
